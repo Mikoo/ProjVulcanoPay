@@ -8,7 +8,7 @@ Sistema de procesamiento de eventos financieros desacoplado mediante **AWS SQS (
 
 | Rol | Integrante | Archivos a Cargo | Estado |
 | :--- | :--- | :--- | :--- |
-| **Rol 1:** Robustez de Entradas, Excepciones y Sanitización | **Paz Villarreal, Sebastián** | `src/vulcano_telemetry/exceptions.py`<br>`src/vulcano_telemetry/sanitizer.py` | ✅ Asignado |
+| **Rol 1:** Robustez de Entradas, Excepciones y Sanitización | **Paz Villarreal, Sebastián** | `src/vulcano_telemetry/exceptions.py`<br>`src/vulcano_telemetry/sanitizer.py` | ✅ Implementado |
 | **Rol 2:** Mensajería Asíncrona SQS con Boto3 y LocalStack | *Por definir (Georgina / Tamara / Leonel)* | `src/vulcano_telemetry/core_sqs.py` | ⏳ Pendiente |
 | **Rol 3:** Seguridad Criptográfica HMAC y Receptor FastAPI | *Por definir (Georgina / Tamara / Leonel)* | `src/vulcano_telemetry/webhook_crypto.py`<br>`src/vulcano_telemetry/webhook_receiver.py` | ⏳ Pendiente |
 | **Rol 4:** Observabilidad, Logging JSON y Compresión Gzip | **Isella, Lucía Daniza** | `src/vulcano_telemetry/logging_engine.py` | ✅ Asignado |
@@ -40,8 +40,12 @@ ProjVulcanoPay/
 │   │   └── logging_engine.py     # AsyncJSONFormatter, QueueHandler/Listener y Gzip rollover [Rol 4]
 │   └── app_operator.py           # Punto de entrada CLI ejecutable (argparse + except* + PEP 765) [Rol 5]
 ├── tests/
+│   ├── test_exceptions.py        # Jerarquía de excepciones y add_note() [Rol 1]
+│   ├── test_sanitizer.py         # Validadores CLI y casos de borde [Rol 1]
 │   ├── test_chaos.py             # Inyección de caos, firmas inválidas y Poison Messages a DLQ [Rol 6]
 │   └── test_forensic_log.py      # Validación de logs JSON y descompresión Gzip [Rol 6]
+├── docs/
+│   └── ROL1.md                   # Contrato, pruebas y notas de integración del Rol 1
 ├── requirements.txt              # Dependencias del proyecto
 ├── pyproject.toml                # Configuración de rutas para pytest
 └── README.md                     # Guía del proyecto y documentación técnica
@@ -61,6 +65,8 @@ ProjVulcanoPay/
    - `parse_wait_time(value)`: Valida que `WaitTimeSeconds` esté entre `1` y `20` segundos.
    - `parse_webhook_url(value)`: Valida con `urllib.parse` que sea una URL `http` o `https` válida.
    - `parse_secret_key(value)`: Valida que la clave secreta HMAC tenga al menos `16` caracteres.
+
+> **Implementación y contrato detallado:** [`docs/ROL1.md`](docs/ROL1.md).
 
 ### 🔹 Rol 2: Mensajería SQS con Boto3 y LocalStack (`core_sqs.py`)
 1. **`get_sqs_client(endpoint_url="http://localhost:4566")`**: Cliente `boto3.client("sqs", ...)` con credenciales simuladas (`test` / `us-east-1`).
@@ -106,6 +112,22 @@ ProjVulcanoPay/
 4. **Raw Bytes + `compare_digest`**: Validar siempre la firma HMAC sobre `await request.body()` antes de `.json()`, usando `hmac.compare_digest()`.
 5. **I/O Desacoplado**: Todo log a disco pasa exclusivamente por `QueueHandler` y `QueueListener`.
 6. **Fechas UTC**: Timestamps en logs en formato ISO 8601 UTC (`timezone.utc`).
+
+---
+
+## 🧪 Pruebas
+
+Desde la raíz del repositorio:
+
+```bash
+python -m pytest -q
+```
+
+Estado actual: **70 tests aprobados** (15 de excepciones + 55 de
+sanitizadores del Rol 1).
+
+Para ver el detalle del contrato y los casos de prueba del Rol 1:
+[`docs/ROL1.md`](docs/ROL1.md).
 
 ---
 
