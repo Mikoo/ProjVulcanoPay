@@ -1,0 +1,15 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+    "python.analysis.extraPaths": ["${workspaceFolder}/src"],
+    "pylint.importStrategy": "fromEnvironment",
+    "pylint.lintOnChange": true,
+    "pylint.args": [
+        "--max-line-length=120",
+        "--init-hook=import sys; sys.path.append(\"src\")"
+    ],
+    "flake8.importStrategy": "fromEnvironment",
+    "flake8.args": [
+        "--max-line-length=120",
+        "--extend-ignore=E501"
+    ]
+}
