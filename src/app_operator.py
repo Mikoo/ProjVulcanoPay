@@ -1,7 +1,8 @@
 """
 Punto de entrada CLI y coordinador de integración de Vulcano Pay (Rol 5).
 Integra sanitizadores declarativos, despacho de Webhooks con HMAC-SHA256,
-consumo SQS con Long Polling, captura con except* y apagado PEP 765.
+Idempotencia, Backoff Exponencial con Full Jitter (log2), consumo SQS con
+Long Polling, captura quirúrgica con except* y apagado limpio bajo PEP 765.
 """
 
 import argparse
@@ -9,7 +10,11 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
+import random
 import time
+import uuid
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
@@ -125,71 +130,174 @@ except ImportError:
     )
     logger = logging.getLogger("vulcano_engine")
 
+# Códigos HTTP transitorios que ameritan reintento con Backoff Exponencial
+RETRIABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+DEFAULT_SECRET_FALLBACK = "mi_clave_secreta_super_segura_vulcano_123"
+
 
 # ---------------------------------------------------------------------------
-# 1. Despachador de Webhooks (Client Dispatcher)
+# 1. Algoritmo de Backoff Exponencial con Full Jitter
 # ---------------------------------------------------------------------------
-def dispatch_webhook(
-    target_url: str, secret: str, payload_dict: Dict[str, Any]
-) -> Dict[str, Any]:
+def calculate_full_jitter_backoff(
+    attempt: int, base_delay: float = 0.5, max_delay: float = 8.0
+) -> float:
     """
-    Firma el payload con HMAC-SHA256 e inyecta la cabecera X-Webhook-Signature
-    en una petición HTTP POST hacia el destino especificado.
+    Calcula espera exponencial con Full Jitter acotando el exponente mediante
+    logaritmo en base 2 (math.log2) para evitar desbordamiento de memoria
+    en potencias 2**attempt y desincronizar reintentos concurrentes.
     """
-    payload_str = json.dumps(payload_dict, ensure_ascii=False)
-    payload_bytes = payload_str.encode("utf-8")
+    if attempt < 0 or base_delay <= 0 or max_delay <= 0:
+        return 0.0
+
+    saturation_index = math.log2(max_delay / base_delay)
+    if attempt >= saturation_index:
+        cap = float(max_delay)
+    else:
+        cap = min(max_delay, base_delay * (2 ** attempt))
+
+    return random.uniform(0.0, cap)
+
+
+def build_signed_headers(
+    secret: str, payload_bytes: bytes, event_id: str, event_topic: str
+) -> Dict[str, str]:
+    """
+    Construye las cabeceras HTTP de seguridad e idempotencia:
+    - X-Webhook-Signature: Contrato t=timestamp,v1=signature (HMAC-SHA256)
+    - X-Webhook-Id: Clave de idempotencia estable ante reintentos
+    - X-Webhook-Event: Identificador de enrutamiento del tópico
+    """
     timestamp = int(time.time())
     signature = generate_signature(secret, timestamp, payload_bytes)
-    header_val = f"t={timestamp},v1={signature}"
-
-    headers = {
+    return {
         "Content-Type": "application/json",
-        "X-Webhook-Signature": header_val,
+        "X-Webhook-Signature": f"t={timestamp},v1={signature}",
+        "X-Webhook-Id": event_id,
+        "X-Webhook-Event": event_topic,
     }
 
-    try:
-        response = requests.post(
-            target_url, data=payload_bytes, headers=headers, timeout=10
-        )
-    except requests.RequestException as err:
-        delivery_err = WebhookDeliveryError(
-            f"Error de red al despachar Webhook hacia {target_url}"
-        )
-        delivery_err.add_note(f"Target URL: {target_url}")
-        raise delivery_err from err
 
-    if response.status_code == 401:
+def dispatch_single_request(
+    target_url: str,
+    secret: str,
+    payload_bytes: bytes,
+    event_id: str,
+    event_topic: str,
+) -> requests.Response:
+    """Realiza un único intento HTTP POST recalculando timestamp y firma."""
+    headers = build_signed_headers(
+        secret, payload_bytes, event_id, event_topic
+    )
+    response = requests.post(
+        target_url, data=payload_bytes, headers=headers, timeout=10
+    )
+    if response.status_code in (401, 403):
         sig_err = WebhookSignatureError(
-            f"Receptor rechazó firma o timestamp (401): {response.text}"
+            f"Receptor rechazó firma o timestamp ({response.status_code}): "
+            f"{response.text}"
         )
-        sig_err.add_note(f"X-Webhook-Signature enviada: {header_val}")
+        sig_err.add_note(
+            f"X-Webhook-Signature: {headers['X-Webhook-Signature']}"
+        )
         raise sig_err
-
-    if response.status_code >= 400:
-        http_err = WebhookDeliveryError(
-            f"Destino respondió HTTP {response.status_code}: {response.text}"
-        )
-        http_err.add_note(f"Target URL: {target_url}")
-        raise http_err
-
-    data: Dict[str, Any] = (
-        response.json()
-        if response.content
-        else {"status_code": response.status_code}
-    )
-    logger.info(
-        "Respuesta del receptor Webhook HTTP %s: %s",
-        response.status_code,
-        data,
-    )
-    return data
+    return response
 
 
 # ---------------------------------------------------------------------------
-# 2. Construcción del Parser CLI Declarativo (argparse)
+# 2. Despachador Resiliente de Webhooks (Client Dispatcher)
+# ---------------------------------------------------------------------------
+def dispatch_webhook(
+    target_url: str,
+    secret: str,
+    payload_dict: Dict[str, Any],
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """
+    Firma el payload con HMAC-SHA256 e inyecta X-Webhook-Signature y
+    X-Webhook-Id en una petición HTTP POST con reintentos Full Jitter
+    ante fallos transitorios de red o respuestas HTTP 5xx / 429.
+    """
+    payload_bytes = json.dumps(payload_dict, ensure_ascii=False).encode(
+        "utf-8"
+    )
+    tx_id = payload_dict.get("transaction_id")
+    event_id = str(tx_id) if tx_id else f"evt_{uuid.uuid4().hex[:12]}"
+    event_topic = str(payload_dict.get("event_type", "payment.settlement"))
+
+    for attempt in range(max_retries):
+        try:
+            response = dispatch_single_request(
+                target_url, secret, payload_bytes, event_id, event_topic
+            )
+        except requests.RequestException as err:
+            if attempt < max_retries - 1:
+                delay = calculate_full_jitter_backoff(attempt)
+                logger.warning(
+                    "Fallo de red hacia %s (intento %s/%s). "
+                    "Reintentando en %.2fs...",
+                    target_url,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            delivery_err = WebhookDeliveryError(
+                f"Error de red tras {max_retries} intentos hacia {target_url}"
+            )
+            delivery_err.add_note(f"Target URL: {target_url}")
+            delivery_err.add_note(f"X-Webhook-Id: {event_id}")
+            raise delivery_err from err
+
+        if (
+            response.status_code in RETRIABLE_STATUS_CODES
+            and attempt < max_retries - 1
+        ):
+            delay = calculate_full_jitter_backoff(attempt)
+            logger.warning(
+                "Destino respondió HTTP %s (intento %s/%s). "
+                "Backoff Full Jitter: %.2fs...",
+                response.status_code,
+                attempt + 1,
+                max_retries,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code >= 400:
+            http_err = WebhookDeliveryError(
+                f"Destino respondió HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+            http_err.add_note(f"Target URL: {target_url}")
+            http_err.add_note(f"X-Webhook-Id: {event_id}")
+            raise http_err
+
+        data: Dict[str, Any] = (
+            response.json()
+            if response.content
+            else {"status_code": response.status_code}
+        )
+        logger.info(
+            "Webhook entregado [ID=%s] HTTP %s: %s",
+            event_id,
+            response.status_code,
+            data,
+        )
+        return data
+
+    raise WebhookDeliveryError("Agotados los intentos de entrega.")
+
+
+# ---------------------------------------------------------------------------
+# 3. Construcción del Parser CLI Declarativo (argparse)
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     """Construye el parser CLI integrando los sanitizadores declarativos."""
+    env_secret = os.environ.get(
+        "VULCANO_WEBHOOK_SECRET", DEFAULT_SECRET_FALLBACK
+    )
     parser = argparse.ArgumentParser(
         prog="VulcanoCLI",
         description="Motor de Eventos SQS y Webhooks HMAC (Vulcano Pay)",
@@ -217,8 +325,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--secret",
         type=parse_secret_key,
-        default="mi_clave_secreta_super_segura_vulcano_123",
-        help="Clave secreta HMAC (mínimo 16 caracteres)",
+        default=env_secret,
+        help="Clave secreta HMAC (env VULCANO_WEBHOOK_SECRET o mín. 16 chars)",
     )
     parser.add_argument(
         "--endpoint-url",
@@ -251,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# 3. Operaciones de Coordinación por Modo
+# 4. Operaciones de Coordinación por Modo
 # ---------------------------------------------------------------------------
 def run_produce_sqs(args: argparse.Namespace) -> None:
     """Publica un evento directamente en la cola SQS de LocalStack."""
@@ -345,7 +453,7 @@ def run_start_dispatcher(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Punto de Entrada Principal (except* + Norma PEP 765 en finally)
+# 5. Punto de Entrada Principal (except* + Norma PEP 765 en finally)
 # ---------------------------------------------------------------------------
 def main() -> None:
     """Ejecuta el motor CLI con captura except* y apagado limpio PEP 765."""
