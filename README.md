@@ -1,141 +1,173 @@
-# 🌋 Vulcano Pay — Motor de Eventos SQS, Webhooks HMAC y Observabilidad Asíncrona (TP-2)
+# Vulcano Pay — Motor de Eventos SQS, Webhooks HMAC y Observabilidad Asíncrona (TP-2)
 
-Sistema de procesamiento de eventos financieros desacoplado mediante **AWS SQS (LocalStack)** y **Boto3**, recepción y despacho de **Webhooks HTTP firmados con HMAC-SHA256**, y pipeline de **observabilidad estructurada JSON no bloqueante** con compresión Gzip bajo **Python 3.14 (PEP 765)**.
+Sistema de procesamiento de eventos financieros distribuido y desacoplado mediante **AWS SQS (LocalStack)** y **Boto3**, recepción y despacho de **Webhooks HTTP autenticados con HMAC-SHA256**, y pipeline de **observabilidad estructurada JSON no bloqueante** con compresión Gzip bajo **Python 3.14 (PEP 765)**.
 
 ---
 
-## 👥 Integrantes y Asignación de Roles
+## Integrantes y Asignación de Roles
 
-| Rol | Integrante | Archivos a Cargo | Estado |
+| Rol | Integrante | Módulos a Cargo | Estado |
 | :--- | :--- | :--- | :--- |
-| **Rol 1:** Robustez de Entradas, Excepciones y Sanitización | **Paz Villarreal, Sebastián** | `src/vulcano_telemetry/exceptions.py`<br>`src/vulcano_telemetry/sanitizer.py` | ✅ Implementado |
-| **Rol 2:** Mensajería Asíncrona SQS con Boto3 y LocalStack | *Por definir (Georgina / Tamara / Leonel)* | `src/vulcano_telemetry/core_sqs.py` | ⏳ Pendiente |
-| **Rol 3:** Seguridad Criptográfica HMAC y Receptor FastAPI | *Por definir (Georgina / Tamara / Leonel)* | `src/vulcano_telemetry/webhook_crypto.py`<br>`src/vulcano_telemetry/webhook_receiver.py` | ⏳ Pendiente |
-| **Rol 4:** Observabilidad, Logging JSON y Compresión Gzip | **Isella, Lucía Daniza** | `src/vulcano_telemetry/logging_engine.py` | ✅ Asignado |
-| **Rol 5:** Coordinador CLI, Despachador Webhook y `except*` | **Ahumada, Germán Maximiliano Leonel** | `src/app_operator.py`<br>`src/vulcano_telemetry/__init__.py` | ✅ Asignado |
-| **Rol 6:** Simulación de Caos y Auditoría Forense de Logs | *Por definir (Georgina / Tamara / Leonel)* | `tests/test_chaos.py`<br>`tests/test_forensic_log.py` | ⏳ Pendiente |
-
-**Integrantes del equipo:**
-- Ahumada, Germán Maximiliano Leonel
-- Isasmendi, Leonel
-- Isella, Lucía Daniza
-- Paz Villarreal, Sebastián
-- Sosa, Tamara Gabriela
-- Vaca, Georgina Zulma
+| **Rol 1:** Robustez de Entradas, Excepciones y Sanitización | **Paz Villarreal, Sebastián** | `src/vulcano_telemetry/exceptions.py`<br>`src/vulcano_telemetry/sanitizer.py` | Implementado |
+| **Rol 2:** Mensajería Asíncrona SQS con Boto3 y LocalStack | **Vaca, Georgina Zulma** | `src/vulcano_telemetry/core_sqs.py` | Implementado |
+| **Rol 3:** Seguridad Criptográfica HMAC y Receptor FastAPI | **Sosa, Tamara Gabriela** | `src/vulcano_telemetry/webhook_crypto.py`<br>`src/vulcano_telemetry/webhook_receiver.py` | Implementado |
+| **Rol 4:** Observabilidad, Logging JSON y Compresión Gzip | **Isella, Lucía Daniza** | `src/vulcano_telemetry/logging_engine.py` | Implementado |
+| **Rol 5:** Coordinador CLI, Despachador Webhook y `except*` | **Ahumada, Germán Maximiliano Leonel** | `src/app_operator.py`<br>`src/vulcano_telemetry/__init__.py` | Implementado |
+| **Rol 6:** Simulación de Caos y Auditoría Forense de Logs | **Isasmendi, Leonel** | `tests/test_chaos.py`<br>`tests/test_forensic_log.py` | Implementado |
 
 ---
 
-## 📁 Estructura del Proyecto
+## Video de Presentación y Defensa Técnica
+
+El video con la defensa de cada integrante del equipo, la explicación de arquitectura y la justificación de las decisiones de diseño se encuentra disponible en:
+
+* **Video de la Defensa Técnica:** [https://youtu.be/QP6OSXfH79s](https://youtu.be/QP6OSXfH79s)
+
+---
+
+## Arquitectura del Sistema
+
+```mermaid
+flowchart TD
+    subgraph Frontend_CLI["CLI y Despachador (Rol 5)"]
+        CLI["app_operator.py"]
+        Sanitizer["sanitizer.py (Rol 1)"]
+        Backoff["Full Jitter Backoff (math.log2)"]
+    end
+
+    subgraph Receptor_HTTP["Servidor Webhook (Rol 3)"]
+        FastAPI["webhook_receiver.py (POST /webhook)"]
+        Crypto["webhook_crypto.py\n(HMAC-SHA256 + compare_digest)"]
+    end
+
+    subgraph AWS_LocalStack["AWS SQS / LocalStack (Rol 2)"]
+        SQS["vulcano-events-queue\n(Long Polling)"]
+        DLQ["vulcano-events-dlq\n(Poison Messages)"]
+    end
+
+    subgraph Telemetria["Observabilidad No Bloqueante (Rol 4)"]
+        QHandler["QueueHandler (Memoria RAM)"]
+        QListener["QueueListener (Hilo Secundario)"]
+        GzipLog["RotatingFileHandler\n(2 MB -> .log.gz)"]
+    end
+
+    CLI -->|1. Valida argumentos Fail-Fast| Sanitizer
+    CLI -->|2. POST firmado con X-Webhook-Signature| FastAPI
+    FastAPI -->|3. Valida raw bytes y timestamp < 300s| Crypto
+    Crypto -->|4. Si es válido| FastAPI
+    FastAPI -->|5. HTTP 202 y encola evento| SQS
+    SQS -->|6. Long Polling| CLI
+    SQS -.->|Poison Message tras maxReceiveCount| DLQ
+    CLI & FastAPI & SQS -->|Telemetría estructurada| QHandler
+    QHandler --> QListener --> GzipLog
+```
+
+---
+
+## Estructura del Repositorio
 
 ```text
 ProjVulcanoPay/
 ├── src/
 │   ├── vulcano_telemetry/
-│   │   ├── __init__.py           # Expone la API pública del paquete (__all__) [Rol 5]
-│   │   ├── exceptions.py         # Excepciones semánticas custom de Vulcano y Webhooks [Rol 1]
-│   │   ├── sanitizer.py          # Validación declarativa con argparse (callables custom) [Rol 1]
-│   │   ├── core_sqs.py           # Cliente Boto3, SQS Producer/Consumer con Long Polling [Rol 2]
-│   │   ├── webhook_crypto.py     # Firma y verificación HMAC-SHA256 (Timing-safe + Timestamps) [Rol 3]
-│   │   ├── webhook_receiver.py   # Servidor HTTP local (FastAPI) POST /webhook (<100ms, 202) [Rol 3]
-│   │   └── logging_engine.py     # AsyncJSONFormatter, QueueHandler/Listener y Gzip rollover [Rol 4]
-│   └── app_operator.py           # Punto de entrada CLI ejecutable (argparse + except* + PEP 765) [Rol 5]
+│   │   ├── __init__.py           # Fachada pública (__all__) [Rol 5]
+│   │   ├── exceptions.py         # Jerarquía semántica de errores [Rol 1]
+│   │   ├── sanitizer.py          # Validadores declarativos argparse [Rol 1]
+│   │   ├── core_sqs.py           # Cliente Boto3 SQS, Producer/Consumer [Rol 2]
+│   │   ├── webhook_crypto.py     # Criptografía HMAC-SHA256 Timing-Safe [Rol 3]
+│   │   ├── webhook_receiver.py   # Receptor HTTP FastAPI (POST /webhook) [Rol 3]
+│   │   └── logging_engine.py     # QueueHandler/Listener y compresión Gzip [Rol 4]
+│   └── app_operator.py           # Orquestador CLI con except* y PEP 765 [Rol 5]
 ├── tests/
-│   ├── test_exceptions.py        # Jerarquía de excepciones y add_note() [Rol 1]
-│   ├── test_sanitizer.py         # Validadores CLI y casos de borde [Rol 1]
-│   ├── test_chaos.py             # Inyección de caos, firmas inválidas y Poison Messages a DLQ [Rol 6]
-│   └── test_forensic_log.py      # Validación de logs JSON y descompresión Gzip [Rol 6]
+│   ├── test_exceptions.py        # Tests de jerarquía de excepciones y add_note() [Rol 1]
+│   ├── test_sanitizer.py         # Tests de validación CLI [Rol 1]
+│   ├── test_chaos.py             # Inyección de caos, firmas inválidas y DLQ [Rol 6]
+│   └── test_forensic_log.py      # Validación forense de logs y descompresión Gzip [Rol 6]
 ├── docs/
-│   └── ROL1.md                   # Contrato, pruebas y notas de integración del Rol 1
-├── requirements.txt              # Dependencias del proyecto
-├── pyproject.toml                # Configuración de rutas para pytest
-└── README.md                     # Guía del proyecto y documentación técnica
+│   └── ROL1.md                   # Contrato de integración del Rol 1
+├── requirements.txt              # Dependencias oficiales del proyecto
+├── pyproject.toml                # Configuración de pruebas para pytest
+└── README.md                     # Documentación técnica general
 ```
 
 ---
 
-## 🛠️ Guía Rápida de Tareas por Rol (Resumen de Consigna)
+## Guía de Ejecución Local
 
-### 🔹 Rol 1: Excepciones y Sanitización (`exceptions.py` y `sanitizer.py`)
-1. **`exceptions.py`**:
-   - Excepción base `VulcanoError(Exception)` *(nunca heredar de `BaseException`)*.
-   - Subclases SQS: `SQSConnectionError`, `QueueTimeoutError`, `CorruptedMessageError`.
-   - Subclases Webhook: `WebhookSignatureError`, `WebhookTimestampError`, `WebhookDeliveryError`.
-2. **`sanitizer.py`** (Validadores para `argparse` que lanzan `argparse.ArgumentTypeError`):
-   - `parse_queue_name(value)`: Valida con regex el patrón `^vulcano-[a-z0-9-]+-queue$`.
-   - `parse_wait_time(value)`: Valida que `WaitTimeSeconds` esté entre `1` y `20` segundos.
-   - `parse_webhook_url(value)`: Valida con `urllib.parse` que sea una URL `http` o `https` válida.
-   - `parse_secret_key(value)`: Valida que la clave secreta HMAC tenga al menos `16` caracteres.
+### 1. Preparación del Entorno Virtual (Python 3.14)
 
-> **Implementación y contrato detallado:** [`docs/ROL1.md`](docs/ROL1.md).
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install flake8 pylint
+```
 
-### 🔹 Rol 2: Mensajería SQS con Boto3 y LocalStack (`core_sqs.py`)
-1. **`get_sqs_client(endpoint_url="http://localhost:4566")`**: Cliente `boto3.client("sqs", ...)` con credenciales simuladas (`test` / `us-east-1`).
-2. **`produce_event(sqs_client, queue_url, event_data)`**: Envía JSON con `send_message()` inyectando `MessageAttributes` (`TraceId`, `EventTopic`, `Timestamp`, `Source`). Captura `ClientError`, agrega contexto con `.add_note()` y relanza como `SQSConnectionError`.
-3. **`consume_events(sqs_client, queue_url, wait_time=10, max_messages=5)`**: Consume aplicando **Long Polling** (`WaitTimeSeconds`) y `VisibilityTimeout`. Si el JSON está corrupto lanza `CorruptedMessageError` (para que derive a la DLQ `vulcano-events-dlq`); si se procesa con éxito elimina el mensaje con `delete_message(ReceiptHandle=...)`.
+### 2. Levantar LocalStack y Crear Colas SQS
 
-### 🔹 Rol 3: Criptografía HMAC y Servidor Receptor (`webhook_crypto.py` y `webhook_receiver.py`)
-1. **`webhook_crypto.py`**:
-   - `generate_signature(secret, timestamp, payload_bytes) -> str`: Calcula `HMAC-SHA256` en hex sobre `f"{timestamp}.".encode("utf-8") + payload_bytes`.
-   - `verify_signature(secret, header_value, payload_bytes, tolerance_sec=300) -> bool`: Extrae `t` y `v1` de `X-Webhook-Signature`. Valida antigüedad máxima de 300s contra `time.time()` (si falla lanza `WebhookTimestampError`) y compara firmas en tiempo constante con **`hmac.compare_digest()`** (si falla lanza `WebhookSignatureError`).
-2. **`webhook_receiver.py`**:
-   - Servidor FastAPI con endpoint `POST /webhook`.
-   - Lee `raw_bytes = await request.body()` **antes** de llamar a `await request.json()`, verifica la firma HMAC (devuelve `401 Unauthorized` si falla), publica en SQS LocalStack y responde **`HTTP 202 Accepted`** en menos de 100 ms.
-
-### 🔹 Rol 4: Observabilidad y Logging JSON No Bloqueante (`logging_engine.py`)
-1. **`AsyncJSONFormatter(logging.Formatter)`**:
-   - Formatea cada log en JSON con `timestamp` en **ISO 8601 UTC estricto** (`datetime.now(timezone.utc).isoformat()`), `logger`, `level`, `message`, `process_id`, `thread_name`, `trace_id`, `message_id`, `webhook_id`.
-   - Serializa recursivamente árboles de excepciones (`ExceptionGroup`) incluyendo notas de `.add_note()`.
-2. **`setup_vulcano_logging()`**:
-   - Desacopla la escritura en disco usando `QueueHandler` (`queue.Queue(-1)`) y `QueueListener`.
-   - Configura `RotatingFileHandler` a **2 MB** (`backupCount=3`) con callbacks `gzip_namer` y `gzip_rotator` para comprimir los rotados a `.log.gz`.
-
-### 🔹 Rol 5: Coordinador CLI, Despachador y `except*` (`app_operator.py` e `__init__.py`)
-1. **`dispatch_webhook(target_url, secret, payload_dict)`**: Firma el evento y envía `POST` con cabecera `X-Webhook-Signature`.
-2. **CLI (`argparse`)**: Integra los sanitizadores del Rol 1 y soporta los modos operativos (`produce-sqs`, `start-receiver`, `start-dispatcher`, `send-webhook`).
-3. **Manejo con `except*` y PEP 765**: Captura quirúrgica de grupos de errores (`except* WebhookSignatureError`, `except* WebhookTimestampError`, `except* SQSConnectionError`) y apagado limpio del `QueueListener` en `finally` (sin usar `return`, `break` ni `continue`).
-
-### 🔹 Rol 6: Simulación de Caos y Pruebas Forenses (`tests/`)
-1. **`tests/test_chaos.py`**:
-   - Simula webhooks con firmas falsas y verifica respuesta `401 Unauthorized` / `WebhookSignatureError`.
-   - Simula Replay Attack (timestamp de hace 1 hora) y verifica `WebhookTimestampError`.
-   - Envía *Poison Messages* (JSON inválido) a SQS y verifica su derivación a la Dead Letter Queue (`vulcano-events-dlq`).
-2. **`tests/test_forensic_log.py`**:
-   - Descomprime archivos `.log.gz` generados y valida la presencia e integridad de los campos JSON (`timestamp`, `message_id`, `trace_id`).
-
----
-
-## ⚠️ Reglas Obligatorias de Evaluación (Checklist antes de hacer Push)
-
-1. **Prohibido `BaseException`**: Todas las excepciones custom heredan de `Exception`. Prohibido usar `except: pass` o capturar `BaseException`.
-2. **Norma PEP 765 (Python 3.14)**: Prohibido usar `return`, `break` o `continue` dentro de bloques `finally`.
-3. **Boto3 + LocalStack**: Todas las operaciones SQS usan `boto3` apuntando a `http://localhost:4566`.
-4. **Raw Bytes + `compare_digest`**: Validar siempre la firma HMAC sobre `await request.body()` antes de `.json()`, usando `hmac.compare_digest()`.
-5. **I/O Desacoplado**: Todo log a disco pasa exclusivamente por `QueueHandler` y `QueueListener`.
-6. **Fechas UTC**: Timestamps en logs en formato ISO 8601 UTC (`timezone.utc`).
-
----
-
-## 🧪 Pruebas
-
-Desde la raíz del repositorio:
-
+Si utilizás Docker:
 ```bash
-python -m pytest -q
+docker run -d --name localstack -p 4566:4566 localstack/localstack
 ```
 
-Estado actual: **70 tests aprobados** (15 de excepciones + 55 de
-sanitizadores del Rol 1).
+Crear la Dead Letter Queue y la cola principal con su RedrivePolicy:
+```bash
+# Crear Dead Letter Queue (DLQ)
+aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name vulcano-events-dlq
 
-Para ver el detalle del contrato y los casos de prueba del Rol 1:
-[`docs/ROL1.md`](docs/ROL1.md).
+# Crear Cola Principal vinculada a la DLQ
+aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name vulcano-events-queue \
+  --attributes '{"RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:000000000000:vulcano-events-dlq\",\"maxReceiveCount\":\"3\"}"}'
+```
+
+### 3. Modos Operativos de la CLI (app_operator.py)
+
+* **Iniciar el Servidor Receptor de Webhooks (FastAPI):**
+  ```powershell
+  python src/app_operator.py --mode start-receiver --url http://127.0.0.1:8000/webhook
+  ```
+
+* **Enviar un Webhook Firmado de Prueba:**
+  ```powershell
+  python src/app_operator.py --mode send-webhook --url http://127.0.0.1:8000/webhook
+  ```
+
+* **Publicar un Evento directamente en SQS:**
+  ```powershell
+  python src/app_operator.py --mode produce-sqs --queue vulcano-events-queue
+  ```
+
+* **Iniciar el Despachador de Eventos desde SQS (Long Polling):**
+  ```powershell
+  python src/app_operator.py --mode start-dispatcher --queue vulcano-events-queue --wait-time 10
+  ```
 
 ---
 
-## 🚀 Cómo Configurar el Entorno Local
+## Ejecución de Pruebas y Calidad de Código
 
-1. Clonar el repositorio:
-   `git clone https://github.com/Mikoo/ProjVulcanoPay.git`
-2. Crear y activar el entorno virtual (Python 3.14):
-   `python -m venv .venv` y `.\.venv\Scripts\Activate.ps1`
-3. Instalar dependencias y linters:
-   `pip install -r requirements.txt` y `pip install flake8 pylint`
+* **Correr la suite completa de pruebas:**
+  ```powershell
+  pytest -v
+  ```
+
+* **Auditoría de estilo y sintaxis (PEP 8):**
+  ```powershell
+  flake8 src/ tests/
+  ```
+
+* **Análisis estático de código:**
+  ```powershell
+  $env:PYTHONPATH="src"; pylint src/vulcano_telemetry/ src/app_operator.py
+  ```
+
+---
+
+## Cumplimiento de las 6 Reglas Innegociables de la Cátedra
+
+1. **Prohibición estricta de `BaseException`:** Todas las excepciones del paquete heredan de `VulcanoError(Exception)`. Ningún módulo captura `BaseException`.
+2. **Norma PEP 765 (Python 3.14):** Ningún bloque `finally` contiene sentencias `return`, `break` ni `continue`.
+3. **Boto3 con LocalStack:** Operaciones SQS ejecutadas mediante `boto3` apuntando al endpoint configurable `http://localhost:4566`.
+4. **Validación sobre Raw Bytes:** El receptor FastAPI extrae `await request.body()` antes de deserializar JSON y valida HMAC-SHA256 con `hmac.compare_digest()`.
+5. **Observabilidad Desacoplada (No Bloqueante):** Todo log en disco es procesado exclusivamente por `QueueHandler` y `QueueListener`.
+6. **Timestamps en ISO 8601 UTC:** Fechas y marcas temporales serializadas con `datetime.now(timezone.utc).isoformat()`.
